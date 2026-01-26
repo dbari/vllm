@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Any, cast, overload
 from mistral_common.protocol.instruct.request import (
     ChatCompletionRequest as MistralChatCompletionRequest,
 )
+from mistral_common.protocol.instruct.request import (
+    ReasoningEffort,
+)
 from mistral_common.protocol.instruct.tool_calls import Function, Tool
 from mistral_common.protocol.instruct.validator import ValidationMode
 from mistral_common.tokens.tokenizers.base import (
@@ -190,6 +193,14 @@ def _prepare_apply_chat_template_tools_and_messages(
 def validate_request_params(request: "ChatCompletionRequest"):
     if request.chat_template is not None or request.chat_template_kwargs is not None:
         raise ValueError("chat_template is not supported for Mistral tokenizers.")
+    if (
+        request.reasoning_effort
+        and request.reasoning_effort not in ReasoningEffort.__members__.values()
+    ):
+        raise ValueError(
+            f"reasoning_effort={request.reasoning_effort} is not support by "
+            "Mistral models. Only 'high' and 'none' are."
+        )
 
 
 def _tekken_token_to_id(tokenizer: "Tekkenizer", t: str | bytes) -> int:
@@ -417,6 +428,7 @@ class MistralTokenizer(TokenizerLike):
         padding = kwargs.get("padding", False)
         truncation = kwargs.get("truncation", False)
         max_length = kwargs.get("max_length")
+        reasoning_effort = kwargs.get("reasoning_effort")
 
         messages, tools = _prepare_apply_chat_template_tools_and_messages(
             messages, tools, continue_final_message, add_generation_prompt
@@ -432,6 +444,7 @@ class MistralTokenizer(TokenizerLike):
             max_length=max_length,
             return_tensors=None,
             return_dict=False,
+            reasoning_effort=reasoning_effort,
         )
 
     def decode(self, ids: list[int] | int, skip_special_tokens: bool = False) -> str:

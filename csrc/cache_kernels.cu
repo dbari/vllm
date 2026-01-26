@@ -960,9 +960,10 @@ void gather_and_maybe_dequant_cache(
     TORCH_CHECK(seq_starts.value().dtype() == torch::kInt32,
                 "seq_starts must be int32");
   }
-  TORCH_CHECK(head_dim == 576,
-              "gather_and_maybe_dequant_cache only support the head_dim to 576 "
-              "for better performance")
+  TORCH_CHECK(
+      head_dim == 320 || head_dim == 576,
+      "gather_and_maybe_dequant_cache only support the head_dim to 320 or 576 "
+      "for better performance")
 
   TORCH_CHECK(src_cache.device() == dst.device(),
               "src_cache and dst must be on the same device");
