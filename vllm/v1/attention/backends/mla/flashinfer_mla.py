@@ -82,9 +82,9 @@ class FlashInferMLABackend(MLACommonBackend):
         if vllm_config.model_config is not None:
             hf_text_config = vllm_config.model_config.hf_text_config
             qk_nope_head_dim = getattr(hf_text_config, "qk_nope_head_dim", 1)
-            if qk_nope_head_dim != 128:
+            if qk_nope_head_dim not in [64, 128]:
                 return (
-                    f"FlashInfer MLA kernel requires qk_nope_head_dim == 128, "
+                    f"FlashInfer MLA kernel requires qk_nope_head_dim in [64, 128], "
                     f"but got {qk_nope_head_dim}"
                 )
         return None
