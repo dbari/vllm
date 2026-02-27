@@ -919,8 +919,8 @@ __global__ void gather_and_maybe_dequant_cache(
 // SCALAR_T is the data type of the destination tensor.
 // CACHE_T is the stored data type of kv-cache.
 // KV_DTYPE is the real data type of kv-cache.
-#define CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE)                        \
-  vllm::gather_and_maybe_dequant_cache<SCALAR_T, CACHE_T, KV_DTYPE, 576,      \
+#define CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, ENTRY_SZ)              \
+  vllm::gather_and_maybe_dequant_cache<SCALAR_T, CACHE_T, KV_DTYPE, ENTRY_SZ, \
                                        thread_block_size>                     \
       <<<grid, block, 0, stream>>>(                                           \
           reinterpret_cast<CACHE_T*>(src_cache.data_ptr()),                   \
@@ -930,6 +930,12 @@ __global__ void gather_and_maybe_dequant_cache(
           block_table_stride, cache_block_stride, cache_entry_stride,         \
           dst_entry_stride, reinterpret_cast<const float*>(scale.data_ptr()), \
           seq_starts_ptr);
+
+#define CALL_GATHER_CACHE_576(SCALAR_T, CACHE_T, KV_DTYPE) \
+  CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 576)
+
+#define CALL_GATHER_CACHE_320(SCALAR_T, CACHE_T, KV_DTYPE) \
+  CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 320)
 
 // Gather sequences from the cache into the destination tensor.
 //  - cu_seq_lens contains the cumulative sequence lengths for each batch
@@ -988,7 +994,13 @@ void gather_and_maybe_dequant_cache(
   const int32_t* seq_starts_ptr =
       seq_starts.has_value() ? seq_starts.value().data_ptr<int32_t>() : nullptr;
 
-  DISPATCH_BY_KV_CACHE_DTYPE(dst.dtype(), kv_cache_dtype, CALL_GATHER_CACHE);
+  if (head_dim == 576) {
+    DISPATCH_BY_KV_CACHE_DTYPE(dst.dtype(), kv_cache_dtype,
+                               CALL_GATHER_CACHE_576);
+  } else {
+    DISPATCH_BY_KV_CACHE_DTYPE(dst.dtype(), kv_cache_dtype,
+                               CALL_GATHER_CACHE_320);
+  }
 }
 
 namespace vllm {
