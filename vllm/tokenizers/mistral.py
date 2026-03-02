@@ -15,7 +15,6 @@ from mistral_common.tokens.tokenizers.base import (
     SpecialTokenPolicy,
     SpecialTokens,
 )
-from mistral_common.tokens.tokenizers.instruct import InstructTokenizerV13
 from mistral_common.tokens.tokenizers.sentencepiece import (
     SentencePieceTokenizer,
 )
@@ -475,6 +474,11 @@ class MistralTokenizer(TokenizerLike):
 
     def convert_tokens_to_string(self, tokens: list[str]) -> str:
         to_decode_special_tokens = {SpecialTokens.tool_calls}
+        if self.version >= 13:
+            if self.instruct.BEGIN_THINK:
+                to_decode_special_tokens.add(SpecialTokens.begin_think)
+            if self.instruct.END_THINK:
+                to_decode_special_tokens.add(SpecialTokens.end_think)
         if self.is_tekken:
             assert isinstance(self.tokenizer, Tekkenizer), type(self.tokenizer)
             tokens = [
@@ -534,7 +538,7 @@ class MistralTokenizer(TokenizerLike):
         non_skip_special_tokens_ids = {
             self.tokenizer.get_special_token(SpecialTokens.tool_calls),
         }
-        if isinstance(self.instruct, InstructTokenizerV13):
+        if self.version >= 13:
             if self.instruct.BEGIN_THINK:
                 non_skip_special_tokens_ids.add(self.instruct.BEGIN_THINK)
             if self.instruct.END_THINK:
