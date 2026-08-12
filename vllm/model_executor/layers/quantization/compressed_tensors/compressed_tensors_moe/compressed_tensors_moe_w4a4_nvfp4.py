@@ -36,6 +36,7 @@ _EPLB_SUPPORTED_NVFP4_BACKENDS = frozenset(
     {
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
+        NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
     }
 )
@@ -75,6 +76,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
+        global_num_experts: int | None = None,
         **extra_weight_attrs,
     ):
         layer.num_experts = num_experts
@@ -162,8 +164,11 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_weight_scale_2, extra_weight_attrs)
 
         # Input Global Scales
+        global_sf_num_experts = (
+            (global_num_experts or num_experts) if self.use_global_sf else num_experts
+        )
         w13_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, w13_num_shards, dtype=torch.float32),
+            torch.empty(global_sf_num_experts, w13_num_shards, dtype=torch.float32),
             requires_grad=False,
         )
         layer.register_parameter("w13_input_global_scale", w13_input_scale)
@@ -173,7 +178,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
         w2_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
+            torch.empty(global_sf_num_experts, dtype=torch.float32),
+            requires_grad=False,
         )
         layer.register_parameter("w2_input_global_scale", w2_input_scale)
         extra_weight_attrs.update(

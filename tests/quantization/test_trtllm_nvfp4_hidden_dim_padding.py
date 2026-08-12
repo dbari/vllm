@@ -5,7 +5,14 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
+    make_nvfp4_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
+    CompressedTensorsW4A4Nvfp4MoEMethod,
+)
 from vllm.model_executor.layers.quantization.utils import flashinfer_fp4_moe
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
@@ -15,12 +22,13 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 )
 
 
-def test_shared_nvfp4_input_scales_have_writable_storage(monkeypatch):
+def test_flashinfer_cutlass_preserves_per_expert_gemm2_scales(monkeypatch):
     monkeypatch.setattr(flashinfer_fp4_moe, "swizzle_blockscale", lambda x: x)
 
     num_experts = 3
     layer = SimpleNamespace(
         activation=SimpleNamespace(is_gated=False),
+        expert_map=None,
         moe_config=SimpleNamespace(
             moe_parallel_config=SimpleNamespace(enable_eplb=False)
         ),
@@ -47,12 +55,142 @@ def test_shared_nvfp4_input_scales_have_writable_storage(monkeypatch):
     a13_scale, a2_scale = outputs[3], outputs[7]
 
     torch.testing.assert_close(a13_scale, torch.full((num_experts,), 3.0))
-    torch.testing.assert_close(a2_scale, torch.full((num_experts,), 6.0))
+    torch.testing.assert_close(a2_scale, torch.tensor([4.0, 5.0, 6.0]))
     distinct_values = torch.arange(num_experts, dtype=torch.float32)
     a13_scale.copy_(distinct_values)
     a2_scale.copy_(distinct_values)
     torch.testing.assert_close(a13_scale, distinct_values)
     torch.testing.assert_close(a2_scale, distinct_values)
+
+
+def test_per_expert_gemm2_scales_follow_ep_local_order(monkeypatch):
+    monkeypatch.setattr(flashinfer_fp4_moe, "swizzle_blockscale", lambda x: x)
+
+    num_local_experts = 2
+    layer = SimpleNamespace(
+        activation=SimpleNamespace(is_gated=False),
+        expert_map=torch.tensor([1, -1, 0, -1], dtype=torch.int32),
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(enable_eplb=False)
+        ),
+    )
+    w13 = torch.zeros((num_local_experts, 2, 1), dtype=torch.uint8)
+    w2 = torch.zeros((num_local_experts, 2, 1), dtype=torch.uint8)
+    w13_scale = torch.zeros((num_local_experts, 2, 1), dtype=torch.float8_e4m3fn)
+    w2_scale = torch.zeros((num_local_experts, 2, 1), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.ones(num_local_experts)
+
+    outputs = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+        backend=NvFp4MoeBackend.FLASHINFER_CUTLASS,
+        layer=layer,
+        w13=w13,
+        w13_scale=w13_scale,
+        w13_scale_2=weight_scale,
+        a13_scale=torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        w2=w2,
+        w2_scale=w2_scale,
+        w2_scale_2=weight_scale,
+        a2_scale=torch.tensor([10.0, 20.0, 30.0, 40.0]),
+        is_act_and_mul=False,
+    )
+
+    torch.testing.assert_close(outputs[3], torch.full((num_local_experts,), 4.0))
+    torch.testing.assert_close(outputs[7], torch.tensor([30.0, 10.0]))
+
+
+def test_global_activation_scale_tables_cover_all_physical_experts():
+    method = object.__new__(CompressedTensorsW4A4Nvfp4MoEMethod)
+    method.moe = SimpleNamespace(is_act_and_mul=True)
+    method.group_size = 16
+    method.use_global_sf = True
+    layer = torch.nn.Module()
+
+    method.create_weights(
+        layer=layer,
+        num_experts=2,
+        global_num_experts=5,
+        hidden_size=16,
+        intermediate_size_per_partition=16,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda *args, **kwargs: None,
+    )
+
+    assert layer.w13_weight_packed.shape[0] == 2
+    assert layer.w2_weight_packed.shape[0] == 2
+    assert layer.w13_input_global_scale.shape == (5, 2)
+    assert layer.w2_input_global_scale.shape == (5,)
+
+
+def test_global_activation_scale_tables_are_not_eplb_expert_weights():
+    layer = torch.nn.Module()
+    layer.local_num_experts = 2
+    layer.register_parameter(
+        "expert_weight",
+        torch.nn.Parameter(torch.arange(6).reshape(2, 3), requires_grad=False),
+    )
+    layer.register_parameter(
+        "w2_input_global_scale",
+        torch.nn.Parameter(torch.arange(4), requires_grad=False),
+    )
+
+    expert_weights = list(RoutedExperts.get_expert_weights(layer))
+
+    assert len(expert_weights) == 1
+    torch.testing.assert_close(expert_weights[0], layer.expert_weight)
+
+
+def test_nonlocal_ep_activation_scale_loads_by_global_expert_id():
+    layer = object.__new__(RoutedExperts)
+    layer.quant_config = None
+    layer.quant_method = type("CompressedTestMethod", (), {"use_global_sf": True})()
+    layer.expert_map_manager = SimpleNamespace(map_global_to_local=lambda _: -1)
+    scale = torch.nn.Parameter(torch.tensor([1.0, 1.0, 1.0, 7.0]))
+
+    layer.weight_loader(
+        param=scale,
+        loaded_weight=torch.tensor(2.0),
+        weight_name="w2_input_global_scale",
+        shard_id="w2",
+        expert_id=2,
+    )
+
+    torch.testing.assert_close(scale, torch.tensor([1.0, 1.0, 2.0, 7.0]))
+
+    fused_scale = torch.nn.Parameter(torch.ones(4, 2))
+    layer.weight_loader(
+        param=fused_scale,
+        loaded_weight=torch.tensor(3.0),
+        weight_name="w13_input_global_scale",
+        shard_id="w3",
+        expert_id=2,
+    )
+    expected = torch.ones(4, 2)
+    expected[2, 1] = 3.0
+    torch.testing.assert_close(fused_scale, expected)
+
+
+def test_per_expert_gemm2_gscale_is_registered_for_eplb():
+    layer = torch.nn.Module()
+    num_experts = 2
+    weight_scale = torch.ones(num_experts)
+    block_scale = torch.ones((num_experts, 1, 1), dtype=torch.float8_e4m3fn)
+
+    quant_config = make_nvfp4_moe_quant_config(
+        backend=NvFp4MoeBackend.FLASHINFER_CUTLASS,
+        w13_scale=block_scale,
+        w2_scale=block_scale,
+        w13_scale_2=weight_scale,
+        w2_scale_2=weight_scale,
+        a13_scale=torch.ones(num_experts),
+        a2_scale=torch.tensor([2.0, 4.0]),
+        layer=layer,
+    )
+
+    assert quant_config.a2_gscale.data_ptr() == layer.a2_gscale.data_ptr()
+    torch.testing.assert_close(quant_config.a2_gscale, torch.tensor([0.5, 0.25]))
+    with torch.no_grad():
+        layer.a2_gscale.copy_(layer.a2_gscale[torch.tensor([1, 0])])
+    torch.testing.assert_close(quant_config.a2_gscale, torch.tensor([0.25, 0.5]))
 
 
 def test_align_trtllm_fp4_moe_hidden_dim_noop():

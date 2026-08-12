@@ -32,6 +32,41 @@ __all__ = [
 ]
 
 
+def _localize_per_expert_scale(
+    scale: torch.Tensor,
+    layer: "RoutedExperts",
+    num_local_experts: int,
+) -> torch.Tensor:
+    """Map a global physical-expert scale vector into rank-local order."""
+    scale = scale.to(torch.float32)
+    if scale.ndim != 1:
+        raise ValueError(f"Expected a 1D per-expert scale, got shape {scale.shape}")
+    if scale.numel() == num_local_experts:
+        return scale.contiguous()
+
+    expert_map = layer.expert_map
+    if expert_map is None or expert_map.numel() < scale.numel():
+        raise ValueError(
+            f"Cannot map {scale.numel()} global expert scales to "
+            f"{num_local_experts} local experts"
+        )
+
+    expert_map = expert_map[: scale.numel()].to(device=scale.device)
+    assigned = expert_map >= 0
+    local_indices = expert_map[assigned].to(torch.long)
+    expected = torch.arange(num_local_experts, device=scale.device)
+    if local_indices.numel() != num_local_experts or not torch.equal(
+        torch.sort(local_indices).values, expected
+    ):
+        raise ValueError("Expert map does not cover every local expert exactly once")
+
+    local_scale = torch.empty(
+        num_local_experts, dtype=torch.float32, device=scale.device
+    )
+    local_scale[local_indices] = scale[assigned]
+    return local_scale
+
+
 def reorder_w1w3_to_w3w1(
     weight: torch.Tensor, scale: torch.Tensor, dim: int = -2
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -375,9 +410,15 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         a13_scale = amax_for_moe_activation_quant(a13_scale, enable_eplb).repeat(
             num_experts
         )
-        a2_scale = amax_for_moe_activation_quant(a2_scale, enable_eplb).repeat(
-            num_experts
-        )
+        if backend in (
+            NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            NvFp4MoeBackend.FLASHINFER_CUTLASS,
+        ):
+            a2_scale = _localize_per_expert_scale(a2_scale, layer, num_experts)
+        else:
+            a2_scale = amax_for_moe_activation_quant(a2_scale, enable_eplb).repeat(
+                num_experts
+            )
     else:
         a13_scale = a13_scale.max(dim=1).values.to(torch.float32)
 

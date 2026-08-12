@@ -635,9 +635,11 @@ class RoutedExperts(PluggableLayer):
         global_expert_id = expert_id
         expert_id = self._map_global_expert_id_to_local_expert_id(global_expert_id)
 
+        is_input_scale = any(
+            suffix in weight_name for suffix in ("input_scale", "input_global_scale")
+        )
         use_global_sf = (
-            getattr(self.quant_method, "use_global_sf", False)
-            and "input_scale" in weight_name
+            getattr(self.quant_method, "use_global_sf", False) and is_input_scale
         )
 
         if expert_id == -1 and not use_global_sf:
@@ -699,10 +701,20 @@ class RoutedExperts(PluggableLayer):
                 )
             return True if return_success else None
 
-        # Case input scale: input_scale loading is only supported for fp8
-        if "input_scale" in weight_name:
+        # Case input activation scale
+        if is_input_scale:
             # this is needed for compressed-tensors only
             loaded_weight = loaded_weight.to(param.data.device)
+            scale_expert_id = global_expert_id if use_global_sf else expert_id
+
+            if "input_global_scale" in weight_name:
+                self._load_per_tensor_weight_scale(
+                    shard_id=shard_id,
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    expert_id=scale_expert_id,
+                )
+                return True if return_success else None
 
             # ModelOpt NVFP4 stores w13 input scales as two logical shards.
             # The generic assignment below would broadcast w1/w3 into the
@@ -712,7 +724,6 @@ class RoutedExperts(PluggableLayer):
                 and param.data.ndim == 2
                 and shard_id in ("w1", "w3")
             ):
-                scale_expert_id = global_expert_id if use_global_sf else expert_id
                 scale_shard_id = 0 if shard_id == "w1" else 1
                 param.data[scale_expert_id][scale_shard_id] = self._to_scalar(
                     loaded_weight
@@ -721,19 +732,19 @@ class RoutedExperts(PluggableLayer):
 
             if (
                 "compressed" in quant_method_name.lower()
-                and param.data[expert_id] != 1
-                and (param.data[expert_id] - loaded_weight).abs() > 1e-5
+                and param.data[scale_expert_id] != 1
+                and (param.data[scale_expert_id] - loaded_weight).abs() > 1e-5
             ):
                 raise ValueError(
                     "input_scales of w1 and w3 of a layer "
-                    f"must be equal. But got {param.data[expert_id]} "
+                    f"must be equal. But got {param.data[scale_expert_id]} "
                     f"vs. {loaded_weight}"
                 )
 
             self._load_single_value(
                 param=param,
                 loaded_weight=loaded_weight,
-                expert_id=global_expert_id if use_global_sf else expert_id,
+                expert_id=scale_expert_id,
             )
             return True if return_success else None
 
@@ -1159,14 +1170,16 @@ class RoutedExperts(PluggableLayer):
         weights = list(self.named_parameters())
         weights = [(name, _maybe_make_contiguous(name, p)) for name, p in weights]
 
-        # `w13_input_scale` and `w2_input_scale` are global per-tensor
-        # activation scales shared across all experts (e.g. NVFP4).
-        # They are broadcast views (stride 0) from .expand() and are
-        # not actual expert weights, so exclude them from EPLB.
+        # Checkpoint activation-scale tables are consumed during post-load
+        # processing. They may use global physical-expert order and must not be
+        # rearranged as rank-local expert weights. Kernel-visible derived
+        # per-expert scales are registered separately.
         NON_EXPERT_WEIGHTS = {
             "e_score_correction_bias",
             "w13_input_scale",
             "w2_input_scale",
+            "w13_input_global_scale",
+            "w2_input_global_scale",
             "hash_indices_table",
         }
 

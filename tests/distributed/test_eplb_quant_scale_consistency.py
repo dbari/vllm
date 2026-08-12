@@ -27,7 +27,11 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 from vllm.platforms import current_platform
 
-EPLB_NVFP4_BACKENDS = ["flashinfer_cutedsl", "flashinfer_trtllm"]
+EPLB_NVFP4_BACKENDS = [
+    "flashinfer_cutedsl",
+    "flashinfer_cutlass",
+    "flashinfer_trtllm",
+]
 
 NUM_EXPERTS = 8
 HIDDEN_SIZE = 128
@@ -131,6 +135,7 @@ def _build_processed_layer(
     method.create_weights(
         layer,
         num_experts=NUM_EXPERTS,
+        global_num_experts=NUM_EXPERTS,
         hidden_size=HIDDEN_SIZE,
         intermediate_size_per_partition=INTERMEDIATE_SIZE,
         params_dtype=torch.bfloat16,
@@ -186,7 +191,7 @@ def test_nvfp4_eplb_rearrangement_matches_reload(backend: str) -> None:
     if not (
         current_platform.is_cuda() and current_platform.is_device_capability_family(100)
     ):
-        pytest.skip("NVFP4 CuteDSL/TRTLLM MoE backends require Blackwell (SM100).")
+        pytest.skip("FlashInfer NVFP4 MoE backends require Blackwell (SM100).")
 
     device = torch.device("cuda:0")
     torch.accelerator.set_device_index(device)
@@ -224,6 +229,8 @@ def test_nvfp4_eplb_rearrangement_matches_reload(backend: str) -> None:
         assert quant_config.g2_alphas.data_ptr() == (
             params["w2_weight_scale_2"].data_ptr()
         )
+        if backend in ("flashinfer_cutlass", "flashinfer_trtllm"):
+            assert quant_config.a2_gscale.data_ptr() == params["a2_gscale"].data_ptr()
         assert quant_config.w1_scale.data_ptr() == (
             params["w13_weight_scale"].data_ptr()
         )
